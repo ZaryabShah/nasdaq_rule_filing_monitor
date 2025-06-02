@@ -17,7 +17,7 @@ import requests
 from bs4 import BeautifulSoup
 
 # ──────────── SETTINGS ─────────────────────────────────────────────────────
-CHECK_INTERVAL_SEC = 60          # poll frequency; 60 s keeps load tiny but fast
+CHECK_INTERVAL_SEC = 1          # poll frequency; 60 s keeps load tiny but fast
 STATE_FILE         = Path("known_rows.json")
 DISCORD_WEBHOOK    = (
     "https://discord.com/api/webhooks/"
