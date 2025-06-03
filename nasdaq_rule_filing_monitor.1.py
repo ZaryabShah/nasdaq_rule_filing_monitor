@@ -1,35 +1,40 @@
 #!/usr/bin/env python3
-# nasdaq_rule_filing_monitor.py
-# Monitors https://listingcenter.nasdaq.com/rulebook/nasdaq/rulefilings
-# and notifies Discord when a new row appears.
-# ───────────────────────────────────────────────────────────────────────────
+"""
+nasdaq_rule_filing_monitor.py  –  2025-06-03 “lazy-cookie + full-async”
 
-import itertools
-import json
-import random
-import sys
-import time
+Keeps the lazy-cookie/IPRoyal/Bot-token logic, but re-adds the
+asynchronous-overlap pattern (bounded concurrent cycles + parallel Discord
+posts) from your earlier script.
+"""
+
+import asyncio, json, random, time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
-import requests
-from bs4 import BeautifulSoup
+import aiohttp
+from selectolax.parser import HTMLParser
 
-# ──────────── SETTINGS ─────────────────────────────────────────────────────
-CHECK_INTERVAL_SEC = 1          # poll frequency; 60 s keeps load tiny but fast
-STATE_FILE         = Path("known_rows.json")
-DISCORD_WEBHOOK    = (
-    "https://discord.com/api/webhooks/"
-    "1361772801802895430/THCcvPzFFArImOwC-RR6KJnfy_3bRRH6i-IH9PQZznKxgJIP46G4RoD9sfDB-VHvt8CJ"
+# ────────────── CONFIG ─────────────────────────────────────────────────────
+CHECK_INTERVAL_SEC        = 1.0
+MAX_CONCURRENT_REQUESTS   = 5          # cycle overlap limit
+CONCURRENCY_LIMIT         = 10         # max simultaneous HTTP ops inside a run
+STATE_FILE                = Path("known_rows.json")
+
+DISCORD_BOT_TOKEN         = (
+    "MTI4NTI0NjExMzU2NTI0OTYzMQ.GVB7mn."
+    "BZzO9Pd5HuaISXEy_rtpa1bHuQ8mszXDxY9MfI"
 )
+DISCORD_CHANNEL_ID        = "1069624139649912882"
 
-# Base headers (everything except UA)
+IPROYAL_ENDPOINT          = "geo.iproyal.com:12321"
+IPROYAL_AUTH              = "dFxlOFzx7ob6oWMx:Rz471juID8qR9AXY"
+
 BASE_HEADERS: Dict[str, str] = {
-    "accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
-        "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-    ),
+    "accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8,application/"
+        "signed-exchange;v=b3;q=0.7",
     "accept-encoding": "gzip, deflate, br, zstd",
     "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
     "cache-control": "no-cache",
@@ -37,159 +42,139 @@ BASE_HEADERS: Dict[str, str] = {
     "referer": "https://listingcenter.nasdaq.com/",
 }
 
-# Full raw list of UAs you provided
-USER_AGENTS: List[str] = [
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Ubuntu Chromium/37.0.2062.94 Chrome/37.0.2062.94 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_5) AppleWebKit/600.8.9 "
-    "(KHTML, like Gecko) Version/8.0.8 Safari/600.8.9",
-    "Mozilla/5.0 (iPad; CPU OS 8_4_1 like Mac OS X) AppleWebKit/600.1.4 "
-    "(KHTML, like Gecko) Version/8.0 Mobile/12H321 Safari/600.1.4",
-    # … if you have more, add them here …
-]
+USER_AGENTS = [ln.strip() for ln in open("user-agents.txt", encoding="utf-8")
+               if ln.strip()]
 
-# Small helper: inexpensive random UA every call
-def random_headers() -> Dict[str, str]:
+def rnd_headers() -> Dict[str, str]:
     return {**BASE_HEADERS, "user-agent": random.choice(USER_AGENTS)}
 
+def proxy_url() -> str:
+    return f"http://{IPROYAL_AUTH}@{IPROYAL_ENDPOINT}"
 
-# Your rotating authenticated proxy pool
-PROXY_CONFIG = [
-    ("72.9.171.237",  12323, "14acfa7f9a57c", "74f453f102"),
-    ("72.9.168.192",  12323, "14acfa7f9a57c", "74f453f102"),
-    ("72.9.171.59",   12323, "14acfa7f9a57c", "74f453f102"),
-    ("84.55.9.31",    12323, "14acfa7f9a57c", "74f453f102"),
-    ("84.55.9.214",   12323, "14acfa7f9a57c", "74f453f102"),
-    ("185.134.193.213",12323,"14acfa7f9a57c","74f453f102"),
-    ("185.134.195.101",12323,"14acfa7f9a57c","74f453f102"),
-    ("46.34.62.86",   12323, "14acfa7f9a57c", "74f453f102"),
-    ("46.34.62.73",   12323, "14acfa7f9a57c", "74f453f102"),
-    ("88.223.21.160", 12323, "14acfa7f9a57c", "74f453f102"),
-    ("88.223.21.110", 12323, "14acfa7f9a57c", "74f453f102"),
-    ("88.223.21.54",  12323, "14acfa7f9a57c", "74f453f102"),
-    ("72.9.172.17",   12323, "14acfa7f9a57c", "74f453f102"),
-    ("72.9.174.238",  12323, "14acfa7f9a57c", "74f453f102"),
-    ("72.9.172.238",  12323, "14acfa7f9a57c", "74f453f102"),
-    ("88.223.22.237", 12323, "14acfa7f9a57c", "74f453f102"),
-    ("88.223.22.82",  12323, "14acfa7f9a57c", "74f453f102"),
-    ("217.67.72.152", 12323, "14acfa7f9a57c", "74f453f102"),
-    ("217.67.72.81",  12323, "14acfa7f9a57c", "74f453f102"),
-    ("91.124.5.243",  12323, "14acfa7f9a57c", "74f453f102"),
-]
+# ────────────── COOKIE BOOTSTRAP ───────────────────────────────────────────
+async def bootstrap_cookies(sess: aiohttp.ClientSession,
+                            hdrs: dict, proxy: str) -> Dict[str, str] | None:
+    try:
+        async with sess.head(
+            "https://listingcenter.nasdaq.com/rulebook/nasdaq",
+            headers=hdrs, proxy=proxy, timeout=10
+        ) as r:
+            r.raise_for_status()
+            return {k: m.value for k, m in r.cookies.items()}
+    except Exception as exc:
+        print(f"⚠️ cookie bootstrap failed: {exc}")
+        return None
 
-# ──────────── INTERNAL UTILS ───────────────────────────────────────────────
-_proxy_cycle = itertools.cycle(PROXY_CONFIG)  # simple round-robin iterator
+# ────────────── HTML FETCH & PARSE ─────────────────────────────────────────
+async def get_html(sess: aiohttp.ClientSession, hdrs: dict,
+                   proxy: str, cookies=None) -> str | None:
+    try:
+        async with sess.get(
+            "https://listingcenter.nasdaq.com/rulebook/nasdaq/rulefilings",
+            headers=hdrs, proxy=proxy, cookies=cookies, timeout=20
+        ) as r:
+            r.raise_for_status()
+            return await r.text()
+    except Exception as exc:
+        print(f"❌ download failed: {exc}")
+        return None
 
+async def fetch_table(sess: aiohttp.ClientSession) -> List[dict]:
+    year  = datetime.now().year
+    hdrs  = rnd_headers()
+    proxy = proxy_url()
 
-def choose_proxy() -> Dict[str, str]:
-    """
-    Return a proxies={} dict suitable for `requests` using the next proxy.
-    Format: {'http': 'http://user:pass@host:port', 'https': 'http://user:pass@host:port'}
-    """
-    host, port, user, pwd = next(_proxy_cycle)
-    proxy_url = f"http://{user}:{pwd}@{host}:{port}"
-    return {"http": proxy_url, "https": proxy_url}
+    # optimistic pass
+    html = await get_html(sess, hdrs, proxy)
+    if html is None or f"NASDAQ-tab-{year}" not in html:
+        cookies = await bootstrap_cookies(sess, hdrs, proxy)
+        html    = await get_html(sess, hdrs, proxy, cookies)
+        if html is None:
+            return []
 
+    root  = HTMLParser(html)
+    table = root.css_first(f"#NASDAQ-tab-{year} > table")
+    if table is None:
+        print("⚠️ no <table> in page")
+        return []
 
-def fetch_table(session: requests.Session) -> List[dict]:
-    """Pull the table for the current year and return rows (dict with id + description)."""
-    year = datetime.now().year
-    url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rulefilings"
-    resp = session.get(
-        url,
-        headers=random_headers(),
-        timeout=30,
-        proxies=choose_proxy()
-    )
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    table = soup.select_one(f"#NASDAQ-tab-{year} > table")
-    if not table:
-        raise RuntimeError(f"Rule table for year {year} not found!")
-
-    rows = []
-    for tr in table.find_all("tr", id=True):
-        # ID looks like SR-NASDAQ-2025-001
-        row_id = tr["id"].strip()
-        desc_cell = tr.find("td", attrs={"data-title": "Description"})
-        if not desc_cell:  # Fallback: assume second cell is description
-            tds = tr.find_all("td")
-            desc_cell = tds[1] if len(tds) > 1 else None
-        description = (
-            desc_cell.get_text(strip=True).replace("\xa0", " ")
-            if desc_cell else ""
-        )
-        rows.append({"id": row_id, "description": description})
+    rows = [{"id": tr.attributes["id"],
+             "description": (tr.css_first('td[data-title="Description"]')
+                              or tr.css("td")[1]).text(strip=True)}
+            for tr in table.css("tr[id]")]
     print(f"Fetched {len(rows)} rows for year {year}.")
     return rows
 
-
-def load_known_ids() -> set:
-    if STATE_FILE.exists():
-        try:
-            return set(json.loads(STATE_FILE.read_text()))
-        except Exception:
-            print("⚠️  Could not read state file, rebuilding from scratch.", file=sys.stderr)
-    return set()
-
-
-def save_known_ids(ids: set) -> None:
-    with STATE_FILE.open("w") as fp:
-        json.dump(sorted(ids), fp)
-
-
-def notify_discord(row: dict) -> None:
-    timestamp = datetime.now(timezone.utc).isoformat()
-    message = (
-        f"🆕 **{row['id']}**\n"
-        f"> {row['description']}\n"
-        f"Detected at: `{timestamp}`"
-    )
+# ────────────── STATE PERSISTENCE ──────────────────────────────────────────
+async def load_known() -> Set[str]:
     try:
-        # Use a standard header here; Discord expects JSON payload without custom UA requirements
-        resp = requests.post(
-            DISCORD_WEBHOOK,
-            json={"content": message},
-            timeout=15
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"❌ Discord notify failed: {e}", file=sys.stderr)
+        return set(json.loads(STATE_FILE.read_text()))
+    except Exception:
+        return set()
 
+async def save_known(ids: Set[str]) -> None:
+    STATE_FILE.write_text(json.dumps(sorted(ids)))
 
-# ──────────── MAIN LOOP ────────────────────────────────────────────────────
+# ────────────── DISCORD (BOT TOKEN) ────────────────────────────────────────
+async def push_discord(row: dict, sess: aiohttp.ClientSession) -> None:
+    ts  = datetime.now(timezone.utc).isoformat()
+    msg = f"🆕 **{row['id']}**\n> {row['description']}\nDetected: `{ts}`"
+
+    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+    hdr = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+    try:
+        async with sess.post(url, json={"content": msg}, headers=hdr,
+                             timeout=10) as r:
+            r.raise_for_status()
+            print(f"✅ pushed {row['id']}")
+    except Exception as exc:
+        print(f"❌ discord failed: {exc}")
+
+# ────────────── ONE CYCLE ──────────────────────────────────────────────────
+HTTP_SEMAPHORE = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+async def cycle(sess: aiohttp.ClientSession, known: Set[str]) -> None:
+    async with HTTP_SEMAPHORE:            # cap parallel network ops
+        t0   = time.perf_counter()
+        rows = await fetch_table(sess)
+        dt   = time.perf_counter() - t0
+
+    if not rows:
+        print(f"⚠️ zero rows (t {dt:.2f}s)")
+        return
+
+    fresh = [r for r in rows if r["id"] not in known]
+    if not fresh:
+        print(datetime.utcnow().strftime("%H:%M:%S"), f"– no new (t {dt:.2f}s)")
+        return
+
+    # parallel Discord pushes
+    tasks = [asyncio.create_task(push_discord(r, sess)) for r in reversed(fresh)]
+    await asyncio.gather(*tasks)
+
+    known.update(r["id"] for r in fresh)
+    await save_known(known)
+    print(f"🔍 {len(fresh)} new rows (t {dt:.2f}s)")
+
+# ────────────── DRIVER ─────────────────────────────────────────────────────
+async def main_async() -> None:
+    known   = await load_known()
+    limiter = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=False, limit=None)) as sess:
+        print(f"🔄 monitor – every {CHECK_INTERVAL_SEC}s (full-async, IPRoyal)")
+        while True:
+            # allow overlap up to MAX_CONCURRENT_REQUESTS cycles
+            async with limiter:
+                asyncio.create_task(cycle(sess, known))
+            await asyncio.sleep(CHECK_INTERVAL_SEC)
+
 def main() -> None:
-    known_ids = load_known_ids()
-    session = requests.Session()
-
-    print("🔄 NASDAQ Rule-filing monitor started – polling every", CHECK_INTERVAL_SEC, "sec.")
-    while True:
-        try:
-            rows = fetch_table(session)
-            new_rows = [r for r in rows if r["id"] not in known_ids]
-            if new_rows:
-                # Process newest first (last row in table is usually newest)
-                for row in reversed(new_rows):
-                    print("→ New filing:", row["id"])
-                    notify_discord(row)
-                    known_ids.add(row["id"])
-                save_known_ids(known_ids)
-            else:
-                print(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), "– no update.")
-        except Exception as exc:
-            print("⚠️  Error:", exc, file=sys.stderr)
-
-        # Sleep the remaining time (simple blocking loop)
-        time.sleep(CHECK_INTERVAL_SEC)
-
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("\n👋 bye")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n👋 Exiting by user request.")
+    main()
